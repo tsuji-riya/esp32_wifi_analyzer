@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="ja" data-color-mode="auto" data-light-theme="light" data-dark-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Wi-Fi Analyzer</title>
+<link rel="stylesheet" href="/primer.css">
+<style>
+body{background:var(--bgColor-default);color:var(--fgColor-default)}
+canvas{display:block;width:100%}
+#chmap{height:300px}#congestion{height:180px}#history{height:220px}
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl th,.tbl td{padding:6px 8px;border-bottom:1px solid var(--borderColor-muted);text-align:left;white-space:nowrap;vertical-align:top}
+.tbl th{position:sticky;top:0;background:var(--bgColor-muted);color:var(--fgColor-muted);cursor:pointer;user-select:none}
+.tbl th[data-dir=asc]::after{content:" ▲"}.tbl th[data-dir=desc]::after{content:" ▼"}
+.tbl tbody tr:hover td{background:var(--bgColor-muted)}
+.tbl td.wrap{white-space:normal}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
+.rssi{display:inline-flex;width:60px;margin-left:6px;vertical-align:middle}
+.stat{min-width:110px}
+.pin{cursor:pointer;background:none;border:0;color:var(--fgColor-muted);font-size:14px;padding:0}
+.pin[aria-pressed=true]{color:var(--fgColor-attention)}
+.Header{flex-wrap:wrap;row-gap:8px}
+.UnderlineNav{overflow-x:auto}
+</style>
+</head>
+<body>
+<header class="Header">
+  <div class="Header-item Header-item--full"><span class="Header-link f4">ESP32 Wi-Fi Analyzer</span></div>
+  <div class="Header-item"><span id="conn" class="Label">接続中…</span></div>
+  <div class="Header-item"><button id="pause" class="btn btn-sm">一時停止</button></div>
+  <div class="Header-item"><button id="export" class="btn btn-sm">JSON エクスポート</button></div>
+  <div class="Header-item mr-0"><button id="reset" class="btn btn-sm btn-danger">リセット</button></div>
+</header>
+
+<main class="container-xl p-3">
+  <div id="alert" class="flash flash-error mb-3" hidden></div>
+
+  <div class="Box mb-3"><div class="Box-body d-flex flex-wrap" id="stats"></div></div>
+
+  <nav class="UnderlineNav mb-3">
+    <div class="UnderlineNav-body" role="tablist">
+      <button class="UnderlineNav-item" role="tab" data-tab="overview" aria-selected="true">チャンネル</button>
+      <button class="UnderlineNav-item" role="tab" data-tab="aps">アクセスポイント <span class="Counter" id="n-aps">0</span></button>
+      <button class="UnderlineNav-item" role="tab" data-tab="clients">クライアント <span class="Counter" id="n-clients">0</span></button>
+      <button class="UnderlineNav-item" role="tab" data-tab="probes">探索 SSID <span class="Counter" id="n-probes">0</span></button>
+      <button class="UnderlineNav-item" role="tab" data-tab="alerts">Deauth <span class="Counter" id="n-deauths">0</span></button>
+    </div>
+  </nav>
+
+  <section data-panel="overview">
+    <div class="Box mb-3">
+      <div class="Box-header"><h2 class="Box-title">チャンネルマップ (2.4 GHz)</h2></div>
+      <div class="Box-body"><canvas id="chmap"></canvas></div>
+    </div>
+    <div class="Box mb-3">
+      <div class="Box-header d-flex flex-items-center">
+        <h2 class="Box-title flex-auto">チャンネル混雑度</h2>
+        <span id="best" class="Label Label--success"></span>
+      </div>
+      <div class="Box-body">
+        <canvas id="congestion"></canvas>
+        <p class="note mt-2 mb-0">バー: 重なる AP の電波強度から算出した干渉スコア / 線: 受信フレーム数 (fps)。
+          フレーム数はスキャン中に滞在したチャンネルで計測するため、AP の待受チャンネルは多めに出ます。</p>
+      </div>
+    </div>
+    <div class="Box">
+      <div class="Box-header"><h2 class="Box-title">信号強度の推移 <span class="color-fg-muted text-normal f6">(★ を付けた AP、未選択時は上位 5 件)</span></h2></div>
+      <div class="Box-body"><canvas id="history"></canvas><div id="legend" class="mt-2 f6"></div></div>
+    </div>
+  </section>
+
+  <section data-panel="aps" hidden>
+    <input class="form-control input-sm mb-2" type="search" placeholder="SSID / BSSID で絞り込み" data-filter="aps" aria-label="AP 絞り込み">
+    <div class="Box overflow-x-auto"><table class="tbl" id="t-aps"></table></div>
+  </section>
+
+  <section data-panel="clients" hidden>
+    <input class="form-control input-sm mb-2" type="search" placeholder="MAC / SSID で絞り込み" data-filter="clients" aria-label="クライアント絞り込み">
+    <div class="Box overflow-x-auto"><table class="tbl" id="t-clients"></table></div>
+    <p class="note">接続先はデータフレーム / アソシエーション要求の BSSID、探索 SSID はプローブ / アソシエーション要求に含まれる SSID です。
+      「ランダム」はローカル管理ビットが立った (プライバシー用) MAC アドレスです。</p>
+  </section>
+
+  <section data-panel="probes" hidden>
+    <div class="Box overflow-x-auto"><table class="tbl" id="t-probes"></table></div>
+    <p class="note">端末が過去に接続したネットワークを探すために送る SSID の集計です。「付近に存在」は同名 AP を検出済みかを示します。</p>
+  </section>
+
+  <section data-panel="alerts" hidden>
+    <div class="Box overflow-x-auto"><table class="tbl" id="t-deauths"></table></div>
+    <p class="note">Deauthentication / Disassociation フレームの直近 32 件。短時間に大量に出る場合は切断攻撃や不安定な AP の可能性があります。</p>
+  </section>
+</main>
+
+<script>
+"use strict";
+const POLL_MS = 2000, ACTIVE_S = 120, HIST_MS = 5 * 60 * 1000, DEAUTH_WINDOW_S = 30, DEAUTH_ALERT = 10;
+const REASONS = {1: "不明", 2: "認証無効", 3: "端末が離脱", 4: "無通信タイムアウト", 5: "AP 過負荷", 6: "未認証からのフレーム",
+  7: "未接続からのフレーム", 8: "端末が離脱 (BSS)", 9: "未認証で接続要求", 15: "4-way ハンドシェイク タイムアウト", 23: "802.1X 認証失敗"};
+const $ = (s) => document.querySelector(s);
+// Builds DOM with textContent only: SSIDs come from the air and are untrusted.
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === "style" || k.startsWith("data-") || k.startsWith("aria-")) e.setAttribute(k, v); else e[k] = v;
+  }
+  for (const k of kids) if (k != null) e.append(k);
+  return e;
+}
+const mac = (m) => m.map((b) => b.toString(16).padStart(2, "0")).join(":");
+const randomMac = (m) => (m[0] & 2) !== 0;
+const age = (s) => s < 60 ? `${s}秒前` : s < 3600 ? `${Math.floor(s / 60)}分前` : `${Math.floor(s / 3600)}時間前`;
+const uptime = (s) => `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m ${s % 60}s`;
+const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function colorOf(bssid) {
+  // FNV-1a + avalanche so MACs differing in one byte still get distant hues
+  let x = 2166136261; for (const b of bssid) x = Math.imul(x ^ b, 16777619);
+  x ^= x >>> 16; x = Math.imul(x, 0x45d9f3b); x = (x ^ (x >>> 16)) >>> 0;
+  return `hsl(${x % 360} 70% 50%)`;
+}
+function ssidNode(s) {
+  return s ? h("span", {textContent: s}) : h("span", {className: "color-fg-muted text-italic", textContent: "(非公開)"});
+}
+function securityLabel(a) {
+  const cls = a === "OPEN" || a === "WEP" ? "Label--danger" : a === "WPA" || a === "WPA/WPA2" ? "Label--attention"
+    : a.includes("WPA3") ? "Label--success" : a === "?" ? "Label--secondary" : "Label--accent";
+  return h("span", {className: `Label ${cls}`, textContent: a === "?" ? "不明" : a});
+}
+function rssiNode(r) {
+  if (r <= -127) return h("span", {className: "color-fg-muted", textContent: "-"});
+  const pct = Math.max(0, Math.min(100, (r + 100) * 100 / 70));
+  const level = r >= -60 ? "success" : r >= -75 ? "attention" : "danger";
+  return h("span", {}, `${r} dBm`, h("span", {className: "Progress Progress--small rssi"},
+    h("span", {className: "Progress-item", style: `width:${pct}%;background:var(--bgColor-${level}-emphasis)`})));
+}
+
+let S = null, prev = null, prevAt = 0, paused = false, fps = new Array(15).fill(0);
+const hist = new Map(); // bssid string -> [[ms, rssi]]
+const pinned = new Set();
+
+// ---------- tabs ----------
+for (const tab of document.querySelectorAll("[data-tab]")) {
+  tab.addEventListener("click", () => {
+    for (const t of document.querySelectorAll("[data-tab]")) t.setAttribute("aria-selected", t === tab);
+    for (const p of document.querySelectorAll("[data-panel]")) p.hidden = p.dataset.panel !== tab.dataset.tab;
+    render();
+  });
+}
+for (const f of document.querySelectorAll("[data-filter]")) f.addEventListener("input", render);
+window.addEventListener("resize", render);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+
+// ---------- sortable tables ----------
+const sortState = {};
+function table(id, cols, rows) {
+  const st = sortState[id] || (sortState[id] = {col: cols.findIndex((c) => c.sort === "default"), dir: cols.find((c) => c.sort === "default")?.dir || "desc"});
+  const col = cols[st.col];
+  if (col && col.key) {
+    rows = rows.slice().sort((a, b) => {
+      const x = col.key(a), y = col.key(b);
+      return (x < y ? -1 : x > y ? 1 : 0) * (st.dir === "asc" ? 1 : -1);
+    });
+  }
+  const head = h("tr", {}, ...cols.map((c, i) => {
+    const th = h("th", {textContent: c.name});
+    if (i === st.col) th.dataset.dir = st.dir;
+    if (c.key) th.addEventListener("click", () => {
+      st.dir = st.col === i && st.dir === "desc" ? "asc" : "desc"; st.col = i; render();
+    });
+    return th;
+  }));
+  const body = rows.length
+    ? rows.map((r) => h("tr", {}, ...cols.map((c) => { const v = c.cell(r); return v instanceof Node ? h("td", {className: c.cls || ""}, v) : h("td", {className: c.cls || "", textContent: v}); })))
+    : [h("tr", {}, h("td", {colSpan: cols.length, className: "color-fg-muted text-center p-3", textContent: "データなし"}))];
+  $(id).replaceChildren(h("thead", {}, head), h("tbody", {}, ...body));
+}
+const filterText = (name) => $(`[data-filter=${name}]`)?.value.trim().toLowerCase() || "";
+
+// ---------- data ----------
+async function poll() {
+  if (!paused) {
+    try {
+      const r = await fetch("/api/state", {cache: "no-store"});
+      if (!r.ok) throw new Error(r.status);
+      ingest(await r.json());
+      setConn(true);
+    } catch (e) { setConn(false); }
+  }
+  setTimeout(poll, POLL_MS);
+}
+function setConn(ok) {
+  const c = $("#conn");
+  c.className = `Label ${ok ? "Label--success" : "Label--danger"}`;
+  c.textContent = ok ? "オンライン" : "切断";
+}
+function ingest(s) {
+  const t = performance.now();
+  if (prev && s.counters.frames >= prev.counters.frames) {
+    const dt = (t - prevAt) / 1000;
+    fps = s.channels.map((c, i) => Math.max(0, (c.frames - prev.channels[i].frames) / dt));
+  }
+  const old = new Map((S ? S.aps : []).map((a) => [mac(a.bssid), a.last_seen]));
+  for (const a of s.aps) {
+    const k = mac(a.bssid);
+    if (a.rssi > -127 && old.get(k) !== a.last_seen) {
+      const arr = hist.get(k) || []; arr.push([Date.now(), a.rssi]); hist.set(k, arr);
+    }
+  }
+  for (const [k, arr] of hist) {
+    while (arr.length && arr[0][0] < Date.now() - HIST_MS) arr.shift();
+    if (!arr.length) hist.delete(k);
+  }
+  prev = s; prevAt = t; S = s;
+  render();
+}
+
+// ---------- render ----------
+function render() {
+  if (!S) return;
+  const s = S, now = s.now;
+  const ssidOf = new Map(s.aps.map((a) => [mac(a.bssid), a.ssid]));
+  const active = s.aps.filter((a) => now - a.last_seen <= ACTIVE_S && a.channel >= 1 && a.channel <= 14);
+  const probeMap = new Map();
+  for (const c of s.clients) for (const p of c.probes) {
+    const e = probeMap.get(p) || []; e.push(c); probeMap.set(p, e);
+  }
+  const recentDeauths = s.deauths.filter((d) => now - d.time <= DEAUTH_WINDOW_S).length;
+
+  $("#n-aps").textContent = s.aps.length;
+  $("#n-clients").textContent = s.clients.length;
+  $("#n-probes").textContent = probeMap.size;
+  $("#n-deauths").textContent = s.counters.deauths;
+
+  const totalFps = fps.reduce((a, b) => a + b, 0);
+  const cnt = s.counters;
+  const dropPct = cnt.frames + cnt.dropped ? (cnt.dropped * 100 / (cnt.frames + cnt.dropped)).toFixed(1) : "0.0";
+  $("#stats").replaceChildren(...[
+    ["稼働時間", uptime(now)], ["AP (稼働中/全体)", `${active.length} / ${s.aps.length}`], ["クライアント", s.clients.length],
+    ["受信フレーム/秒", totalFps.toFixed(0)], ["管理/データ/制御", `${cnt.mgmt} / ${cnt.data} / ${cnt.ctrl}`],
+    ["ビーコン", cnt.beacons], ["プローブ要求", cnt.probes], ["スキャン回数", cnt.scans], ["取りこぼし", `${dropPct}%`],
+  ].map(([k, v]) => h("div", {className: "stat mr-4 mb-1"}, h("div", {className: "f6 color-fg-muted", textContent: k}), h("div", {className: "f3 text-bold", textContent: v}))));
+
+  const alert = $("#alert");
+  alert.hidden = recentDeauths < DEAUTH_ALERT;
+  alert.textContent = `直近 ${DEAUTH_WINDOW_S} 秒で Deauth/Disassoc フレームを ${recentDeauths} 件検出しました。切断攻撃の可能性があります。`;
+
+  const tab = document.querySelector("[data-tab][aria-selected=true]").dataset.tab;
+  if (tab === "overview") { drawChannelMap(active); drawCongestion(active); drawHistory(s); }
+  if (tab === "aps") renderAps(s);
+  if (tab === "clients") renderClients(s, ssidOf);
+  if (tab === "probes") renderProbes(s, probeMap);
+  if (tab === "alerts") renderDeauths(s, ssidOf);
+}
+
+function renderAps(s) {
+  const f = filterText("aps");
+  const clientsOf = new Map();
+  for (const c of s.clients) if (c.bssid) { const k = mac(c.bssid); clientsOf.set(k, (clientsOf.get(k) || 0) + 1); }
+  const rows = s.aps.filter((a) => !f || a.ssid.toLowerCase().includes(f) || mac(a.bssid).includes(f));
+  table("#t-aps", [
+    {name: "★", cell: (a) => {
+      const k = mac(a.bssid), b = h("button", {className: "pin", textContent: pinned.has(k) ? "★" : "☆", "aria-pressed": pinned.has(k), title: "推移グラフに表示"});
+      b.addEventListener("click", () => { pinned.has(k) ? pinned.delete(k) : pinned.add(k); render(); });
+      return b;
+    }},
+    {name: "SSID", key: (a) => a.ssid.toLowerCase(), cell: (a) => h("span", {}, h("span", {className: "swatch", style: `background:${colorOf(a.bssid)}`}), ssidNode(a.ssid))},
+    {name: "BSSID", key: (a) => mac(a.bssid), cell: (a) => h("span", {className: "mono", textContent: mac(a.bssid)})},
+    {name: "Ch", key: (a) => a.channel, cell: (a) => a.channel || "-"},
+    {name: "帯域幅", key: (a) => a.width, cell: (a) => a.width === 40 ? `40 MHz (${a.sec > 0 ? "+" : "-"})` : "20 MHz"},
+    {name: "RSSI", key: (a) => a.rssi, sort: "default", cell: (a) => rssiNode(a.rssi)},
+    {name: "セキュリティ", key: (a) => a.auth, cell: (a) => securityLabel(a.auth)},
+    {name: "クライアント", key: (a) => clientsOf.get(mac(a.bssid)) || 0, cell: (a) => clientsOf.get(mac(a.bssid)) || 0},
+    {name: "ビーコン", key: (a) => a.beacons, cell: (a) => a.beacons},
+    {name: "最終確認", key: (a) => a.last_seen, cell: (a) => age(s.now - a.last_seen)},
+  ], rows);
+}
+
+function renderClients(s, ssidOf) {
+  const f = filterText("clients");
+  const rows = s.clients.filter((c) => !f || mac(c.mac).includes(f) || (c.bssid && (ssidOf.get(mac(c.bssid)) || "").toLowerCase().includes(f))
+    || c.probes.some((p) => p.toLowerCase().includes(f)));
+  table("#t-clients", [
+    {name: "MAC", key: (c) => mac(c.mac), cell: (c) => h("span", {}, h("span", {className: "mono", textContent: mac(c.mac)}),
+      randomMac(c.mac) ? h("span", {className: "Label Label--secondary ml-1", textContent: "ランダム"}) : null)},
+    {name: "接続先 SSID", key: (c) => c.bssid ? ssidOf.get(mac(c.bssid)) || "" : "", cell: (c) => c.bssid
+      ? (ssidOf.has(mac(c.bssid)) ? ssidNode(ssidOf.get(mac(c.bssid))) : h("span", {className: "color-fg-muted", textContent: "(未検出 AP)"}))
+      : h("span", {className: "color-fg-muted", textContent: "未接続"})},
+    {name: "BSSID", key: (c) => c.bssid ? mac(c.bssid) : "", cell: (c) => h("span", {className: "mono", textContent: c.bssid ? mac(c.bssid) : "-"})},
+    {name: "RSSI", key: (c) => c.rssi, cell: (c) => rssiNode(c.rssi)},
+    {name: "探索 SSID", cls: "wrap", key: (c) => c.probes.length, cell: (c) => h("span", {}, ...c.probes.map((p) => h("span", {className: "Label mr-1 mb-1", textContent: p})))},
+    {name: "フレーム", key: (c) => c.frames, cell: (c) => c.frames},
+    {name: "最終確認", key: (c) => c.last_seen, sort: "default", cell: (c) => age(s.now - c.last_seen)},
+  ], rows);
+}
+
+function renderProbes(s, probeMap) {
+  const nearby = new Set(s.aps.map((a) => a.ssid));
+  const rows = [...probeMap].map(([ssid, cs]) => ({ssid, cs, last: Math.max(...cs.map((c) => c.last_seen))}));
+  table("#t-probes", [
+    {name: "SSID", key: (r) => r.ssid.toLowerCase(), cell: (r) => r.ssid},
+    {name: "端末数", key: (r) => r.cs.length, sort: "default", cell: (r) => r.cs.length},
+    {name: "付近に存在", key: (r) => nearby.has(r.ssid), cell: (r) => nearby.has(r.ssid)
+      ? h("span", {className: "Label Label--success", textContent: "あり"}) : h("span", {className: "Label Label--secondary", textContent: "なし"})},
+    {name: "端末", cls: "wrap", cell: (r) => h("span", {className: "mono", textContent: r.cs.map((c) => mac(c.mac)).join(", ")})},
+    {name: "最終確認", key: (r) => r.last, cell: (r) => age(s.now - r.last)},
+  ], rows);
+}
+
+function renderDeauths(s, ssidOf) {
+  table("#t-deauths", [
+    {name: "時刻", key: (d) => d.time, sort: "default", cell: (d) => age(s.now - d.time)},
+    {name: "種類", key: (d) => d.kind, cell: (d) => h("span", {className: `Label ${d.kind === "deauth" ? "Label--danger" : "Label--attention"}`, textContent: d.kind})},
+    {name: "送信元", key: (d) => mac(d.src), cell: (d) => h("span", {className: "mono", textContent: mac(d.src)})},
+    {name: "宛先", key: (d) => mac(d.dst), cell: (d) => h("span", {className: "mono", textContent: d.dst.every((b) => b === 255) ? "ブロードキャスト" : mac(d.dst)})},
+    {name: "AP", key: (d) => ssidOf.get(mac(d.bssid)) || "", cell: (d) => h("span", {}, ssidNode(ssidOf.get(mac(d.bssid)) || ""), h("span", {className: "mono color-fg-muted ml-1", textContent: mac(d.bssid)}))},
+    {name: "理由", key: (d) => d.reason, cell: (d) => `${d.reason} ${REASONS[d.reason] || ""}`},
+    {name: "Ch", key: (d) => d.channel, cell: (d) => d.channel},
+    {name: "RSSI", key: (d) => d.rssi, cell: (d) => `${d.rssi} dBm`},
+  ], s.deauths);
+}
+
+// ---------- charts ----------
+function setupCanvas(id) {
+  const c = $(id), dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, hgt = c.clientHeight;
+  c.width = w * dpr; c.height = hgt * dpr;
+  const g = c.getContext("2d");
+  g.scale(dpr, dpr);
+  g.font = "11px -apple-system,BlinkMacSystemFont,sans-serif";
+  return {g, w, h: hgt};
+}
+const PAD = {l: 40, r: 10, t: 10, b: 24};
+const RSSI_MIN = -100, RSSI_MAX = -20;
+// Channel n is centred at 2407 + 5n MHz (ch 14 at 2484); x axis spans ch -1..15 so 20 MHz skirts fit.
+const chX = (ch, w) => PAD.l + (ch + 1) / 16 * (w - PAD.l - PAD.r);
+const yOf = (r, hgt) => PAD.t + (RSSI_MAX - r) / (RSSI_MAX - RSSI_MIN) * (hgt - PAD.t - PAD.b);
+function centre(a) { return a.channel + (a.width === 40 ? 2 * a.sec : 0); }
+
+function axes(g, w, hgt, yTicks, yLabel) {
+  g.strokeStyle = cssVar("--borderColor-muted"); g.fillStyle = cssVar("--fgColor-muted"); g.lineWidth = 1;
+  for (const [v, y] of yTicks) {
+    g.beginPath(); g.moveTo(PAD.l, y); g.lineTo(w - PAD.r, y); g.stroke();
+    g.textAlign = "right"; g.fillText(yLabel(v), PAD.l - 4, y + 4);
+  }
+}
+function chTicks(g, w, hgt) {
+  g.textAlign = "center"; g.fillStyle = cssVar("--fgColor-muted");
+  for (let ch = 1; ch <= 14; ch++) g.fillText(ch, chX(ch, w), hgt - 6);
+}
+
+function drawChannelMap(aps) {
+  const {g, w, h: hgt} = setupCanvas("#chmap");
+  const ticks = []; for (let r = -90; r <= -30; r += 10) ticks.push([r, yOf(r, hgt)]);
+  axes(g, w, hgt, ticks, (v) => v);
+  chTicks(g, w, hgt);
+  const base = yOf(RSSI_MIN, hgt);
+  for (const a of aps.slice().sort((x, y) => x.rssi - y.rssi)) {
+    if (a.rssi <= -127) continue;
+    const c = centre(a), half = a.width === 40 ? 4 : 2, col = colorOf(a.bssid);
+    const x0 = chX(c - half, w), x1 = chX(c + half, w), xc = chX(c, w), top = yOf(Math.max(RSSI_MIN, Math.min(RSSI_MAX, a.rssi)), hgt);
+    g.beginPath(); g.moveTo(x0, base);
+    // flat-topped skirt: rises over the outer quarter on each side
+    g.bezierCurveTo(x0 + (xc - x0) * 0.25, top, x0 + (xc - x0) * 0.4, top, xc, top);
+    g.bezierCurveTo(x1 - (x1 - xc) * 0.4, top, x1 - (x1 - xc) * 0.25, top, x1, base);
+    g.fillStyle = col.replace(")", " / 0.15)"); g.fill();
+    g.strokeStyle = col; g.lineWidth = 2; g.stroke();
+    g.fillStyle = col; g.textAlign = "center";
+    g.fillText(a.ssid || "(非公開)", xc, top - 4);
+  }
+}
+
+function congestion(aps) {
+  const score = new Array(15).fill(0);
+  for (const a of aps) {
+    if (a.rssi <= -127) continue;
+    const c = centre(a), span = a.width === 40 ? 4 : 2, wgt = Math.max(0, a.rssi - RSSI_MIN) / (RSSI_MAX - RSSI_MIN);
+    for (let ch = 1; ch <= 14; ch++) score[ch] += Math.max(0, 1 - Math.abs(ch - c) / (span + 1)) * wgt;
+  }
+  return score;
+}
+
+function drawCongestion(aps) {
+  const {g, w, h: hgt} = setupCanvas("#congestion");
+  const score = congestion(aps), maxS = Math.max(1, ...score), maxF = Math.max(10, ...fps.slice(1));
+  const ticks = [0, 0.5, 1].map((f) => [f * maxS, PAD.t + (1 - f) * (hgt - PAD.t - PAD.b)]);
+  axes(g, w, hgt, ticks, (v) => v.toFixed(1));
+  chTicks(g, w, hgt);
+  const best = [1, 6, 11].reduce((b, ch) => score[ch] < score[b] ? ch : b, 1);
+  $("#best").textContent = `推奨チャンネル: ${best} (1/6/11 のうち最も空き)`;
+  const bw = (chX(1, w) - chX(0, w)) * 0.6, ih = hgt - PAD.t - PAD.b;
+  for (let ch = 1; ch <= 14; ch++) {
+    const bh = score[ch] / maxS * ih;
+    g.fillStyle = ch === best ? cssVar("--fgColor-success") : cssVar("--fgColor-accent");
+    g.globalAlpha = 0.7; g.fillRect(chX(ch, w) - bw / 2, PAD.t + ih - bh, bw, bh); g.globalAlpha = 1;
+  }
+  g.strokeStyle = cssVar("--fgColor-attention"); g.lineWidth = 2; g.beginPath();
+  for (let ch = 1; ch <= 14; ch++) {
+    const y = PAD.t + ih - fps[ch] / maxF * ih;
+    ch === 1 ? g.moveTo(chX(ch, w), y) : g.lineTo(chX(ch, w), y);
+  }
+  g.stroke();
+  g.fillStyle = cssVar("--fgColor-attention"); g.textAlign = "right";
+  g.fillText(`最大 ${maxF.toFixed(0)} fps`, w - PAD.r, PAD.t + 10);
+}
+
+function drawHistory(s) {
+  const {g, w, h: hgt} = setupCanvas("#history");
+  const ticks = []; for (let r = -90; r <= -30; r += 20) ticks.push([r, yOf(r, hgt)]);
+  axes(g, w, hgt, ticks, (v) => v);
+  let keys = [...pinned].filter((k) => hist.has(k));
+  if (!keys.length) keys = s.aps.filter((a) => hist.has(mac(a.bssid))).sort((a, b) => b.rssi - a.rssi).slice(0, 5).map((a) => mac(a.bssid));
+  const t1 = Date.now(), t0 = t1 - HIST_MS, xOf = (t) => PAD.l + (t - t0) / HIST_MS * (w - PAD.l - PAD.r);
+  g.fillStyle = cssVar("--fgColor-muted"); g.textAlign = "center";
+  for (let m = 5; m >= 0; m--) g.fillText(m ? `-${m}分` : "現在", xOf(t1 - m * 60000), hgt - 6);
+  const byKey = new Map(s.aps.map((a) => [mac(a.bssid), a]));
+  const legend = [];
+  for (const k of keys) {
+    const a = byKey.get(k); if (!a) continue;
+    const col = colorOf(a.bssid), pts = hist.get(k);
+    g.strokeStyle = col; g.lineWidth = 2; g.beginPath();
+    pts.forEach(([t, r], i) => { const x = xOf(t), y = yOf(Math.max(RSSI_MIN, r), hgt); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+    legend.push(h("span", {className: "mr-3 d-inline-block"}, h("span", {className: "swatch", style: `background:${col}`}), ssidNode(a.ssid), ` ${a.rssi} dBm`));
+  }
+  $("#legend").replaceChildren(...legend);
+}
+
+// ---------- actions ----------
+$("#pause").addEventListener("click", (e) => { paused = !paused; e.target.textContent = paused ? "再開" : "一時停止"; });
+$("#export").addEventListener("click", () => {
+  if (!S) return;
+  const data = {exported_at: new Date().toISOString(), state: S, rssi_history: Object.fromEntries(hist)};
+  const a = h("a", {href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], {type: "application/json"})),
+    download: `wifi-analyzer-${Date.now()}.json`});
+  a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+$("#reset").addEventListener("click", async () => {
+  if (!confirm("収集したデータをすべて消去しますか?")) return;
+  await fetch("/api/reset", {method: "POST"});
+  hist.clear(); prev = null; S = null; fps.fill(0);
+});
+poll();
+</script>
+</body>
+</html>

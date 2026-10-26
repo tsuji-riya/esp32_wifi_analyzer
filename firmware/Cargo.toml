@@ -1,0 +1,47 @@
+[package]
+name = "wifi-analyzer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+analyzer-core = { path = "../core" }
+critical-section = "1"
+edge-dhcp = "0.8.0"
+edge-nal = "0.7.0"
+edge-nal-embassy = "0.9.0"
+embassy-executor = "0.10.0"
+embassy-net = { version = "0.9.0", features = ["medium-ethernet", "tcp", "udp"] }
+embassy-sync = "0.8"
+embassy-time = "0.5.0"
+embedded-io-async = "0.7"
+esp-alloc = "0.11.0"
+esp-backtrace = { version = "0.20.0", features = ["panic-handler", "println"] }
+esp-bootloader-esp-idf = "0.6.0"
+esp-hal = { version = "1.2.0", features = ["log-04", "unstable"] }
+esp-println = { version = "0.18.0", features = ["log-04"] }
+esp-radio = { version = "=1.0.0-beta.1", features = ["log-04", "wifi", "sniffer", "unstable"] }
+esp-rtos = { version = "0.4.0", features = ["esp-radio", "embassy", "log-04"] }
+log = "0.4"
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+static_cell = "2.1.0"
+
+[features]
+default = ["esp32"]
+esp32 = [
+    "esp-alloc/esp32",
+    "esp-backtrace/esp32",
+    "esp-bootloader-esp-idf/esp32",
+    "esp-hal/esp32",
+    "esp-rtos/esp32",
+    "esp-radio/esp32",
+]
+
+[profile.dev]
+# Wi-Fi is too slow / unstable without optimization.
+opt-level = "s"
+
+[profile.release]
+debug = true
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
